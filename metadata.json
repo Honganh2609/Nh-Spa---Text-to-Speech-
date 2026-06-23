@@ -1,0 +1,6 @@
+{
+  "name": "Vietnamese Text-to-Speech",
+  "description": "Ứng dụng chuyển đổi văn bản tiếng Việt thành giọng nói chất lượng cao sử dụng trí tuệ nhân tạo Gemini, hỗ trợ điều chỉnh tốc độ, giọng đọc miền Bắc - Trung - Nam, và tải file âm thanh MP3.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
