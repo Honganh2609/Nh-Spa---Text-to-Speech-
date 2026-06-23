@@ -103,36 +103,62 @@ export default function App() {
         ]);
       });
 
-    // 2. Load Speech history from LocalStorage
+    // 2. Load Speech history from LocalStorage with fallback and self-cleaning
     const storedHistory = localStorage.getItem("vi_tts_history");
     if (storedHistory) {
       try {
-        setHistory(JSON.parse(storedHistory));
+        const parsed = JSON.parse(storedHistory);
+        if (Array.isArray(parsed)) {
+          // Keep at most 30 history records, and retain audioContent for only the top 3 newest entries
+          let geminiCount = 0;
+          const cleaned = parsed.slice(0, 30).map(item => {
+            if (item.engine === "gemini" && item.audioContent) {
+              geminiCount++;
+              if (geminiCount > 3) {
+                const { audioContent, ...rest } = item;
+                return rest;
+              }
+            }
+            return item;
+          });
+          setHistory(cleaned);
+          localStorage.setItem("vi_tts_history", JSON.stringify(cleaned));
+        }
       } catch (e) {
         console.error("Lỗi parse lịch sử lưu trữ:", e);
       }
     }
 
     // 3. Setup Browser Speech Synthesis voces callback
-    if (typeof window !== "undefined" && window.speechSynthesis) {
-      const getBrowserVoices = () => {
-        const voices = window.speechSynthesis.getVoices();
-        // Filter primarily for Vietnamese voices, but preserve some high-quality global fallbacks
-        const viVoices = voices.filter(v => v.lang.toLowerCase().includes("vi"));
-        const otherVoices = voices.filter(v => !v.lang.toLowerCase().includes("vi"));
-        
-        // Put Vietnamese first
-        const sorted = [...viVoices, ...otherVoices].slice(0, 40);
-        setBrowserVoices(sorted);
-        
-        if (sorted.length > 0) {
-          const defaultVi = sorted.find(v => v.lang.toLowerCase().includes("vi")) || sorted[0];
-          setSelectedBrowserVoiceURI(defaultVi.voiceURI);
-        }
-      };
+    try {
+      if (typeof window !== "undefined" && window.speechSynthesis) {
+        const getBrowserVoices = () => {
+          try {
+            const voices = window.speechSynthesis.getVoices();
+            // Filter primarily for Vietnamese voices, but preserve some high-quality global fallbacks
+            const viVoices = voices.filter(v => v && v.lang && typeof v.lang === "string" && v.lang.toLowerCase().includes("vi"));
+            const otherVoices = voices.filter(v => v && (!v.lang || typeof v.lang !== "string" || !v.lang.toLowerCase().includes("vi")));
+            
+            // Put Vietnamese first
+            const sorted = [...viVoices, ...otherVoices].slice(0, 40);
+            setBrowserVoices(sorted);
+            
+            if (sorted.length > 0) {
+              const defaultVi = sorted.find(v => v && v.lang && typeof v.lang === "string" && v.lang.toLowerCase().includes("vi")) || sorted[0];
+              if (defaultVi) {
+                setSelectedBrowserVoiceURI(defaultVi.voiceURI);
+              }
+            }
+          } catch (e) {
+            console.warn("Lỗi lấy danh sách giọng từ speechSynthesis:", e);
+          }
+        };
 
-      getBrowserVoices();
-      window.speechSynthesis.onvoiceschanged = getBrowserVoices;
+        getBrowserVoices();
+        window.speechSynthesis.onvoiceschanged = getBrowserVoices;
+      }
+    } catch (e) {
+      console.warn("Speech synthesis local engine blocked by browser window / iframe sandbox:", e);
     }
   }, []);
 
@@ -143,10 +169,58 @@ export default function App() {
     }
   }, [volume, isMuted]);
 
-  // Sync history updates to LocalStorage
+  // Sync history updates to LocalStorage safely avoiding any QuotaExceeded errors
   const saveHistory = (updatedHistory: HistoryItem[]) => {
-    setHistory(updatedHistory);
-    localStorage.setItem("vi_tts_history", JSON.stringify(updatedHistory));
+    // Limit history size to 30 entries maximum
+    let pruned = updatedHistory.slice(0, 30);
+    
+    // Count how many gemini items have audioContent.
+    // Keep only the first 3 (newest) gemini items with audioContent, strip the rest to avoid LocalStorage overflow!
+    let geminiCount = 0;
+    pruned = pruned.map(item => {
+      if (item.engine === "gemini" && item.audioContent) {
+        geminiCount++;
+        if (geminiCount > 3) {
+          const { audioContent, ...rest } = item;
+          return rest;
+        }
+      }
+      return item;
+    });
+
+    setHistory(pruned);
+
+    try {
+      localStorage.setItem("vi_tts_history", JSON.stringify(pruned));
+    } catch (e: any) {
+      console.warn("Lưu trữ LocalStorage tiếp cận giới hạn quy định, đang dọn dẹp chủ động...", e);
+      // If writing still fails, aggressively strip all but the very latest generated audio file
+      let superPruned = pruned.map((item, idx) => {
+        if (idx > 0 && item.audioContent) {
+          const { audioContent, ...rest } = item;
+          return rest;
+        }
+        return item;
+      });
+
+      try {
+        localStorage.setItem("vi_tts_history", JSON.stringify(superPruned));
+        setHistory(superPruned);
+      } catch (err) {
+        console.error("Lỗi nghiêm trọng: LocalStorage bị khóa toàn bộ", err);
+        // Fallback: strip ALL base64 audioContent to save metadata only
+        const metaOnly = pruned.map(item => {
+          const { audioContent, ...rest } = item;
+          return rest;
+        });
+        try {
+          localStorage.setItem("vi_tts_history", JSON.stringify(metaOnly));
+          setHistory(metaOnly);
+        } catch (finalErr) {
+          console.error("Không thể ghi tệp cấu hình Metadata vào LocalStorage", finalErr);
+        }
+      }
+    }
   };
 
   // Simple feedback alert helper
@@ -178,7 +252,7 @@ export default function App() {
       const utterance = new SpeechSynthesisUtterance(demoPrefix);
       
       // Try to find a Vietnamese system voice
-      const viVoice = browserVoices.find(v => v.lang.startsWith("vi") || v.lang.includes("VI"));
+      const viVoice = browserVoices.find(v => v && v.lang && typeof v.lang === "string" && (v.lang.startsWith("vi") || v.lang.includes("VI")));
       if (viVoice) {
         utterance.voice = viVoice;
         utterance.lang = viVoice.lang;
@@ -211,12 +285,14 @@ export default function App() {
       
       window.speechSynthesis.cancel();
 
-      const selectedSystemVoice = browserVoices.find(v => v.voiceURI === selectedBrowserVoiceURI);
+      const selectedSystemVoice = browserVoices.find(v => v && v.voiceURI === selectedBrowserVoiceURI);
       const utterance = new SpeechSynthesisUtterance(textToSpeak);
       
       if (selectedSystemVoice) {
         utterance.voice = selectedSystemVoice;
-        utterance.lang = selectedSystemVoice.lang;
+        if (selectedSystemVoice.lang) {
+          utterance.lang = selectedSystemVoice.lang;
+        }
       }
 
       utterance.rate = parseFloat(rateVal);
@@ -241,7 +317,7 @@ export default function App() {
       browserUtteranceRef.current = utterance;
       
       const voiceLabel = selectedSystemVoice ? selectedSystemVoice.name : "Hệ Thống";
-      const langLabel = selectedSystemVoice ? selectedSystemVoice.lang : "vi-VN";
+      const langLabel = selectedSystemVoice && selectedSystemVoice.lang ? selectedSystemVoice.lang : "vi-VN";
 
       const historyItem: HistoryItem = {
         id: `tts-${Date.now()}`,
@@ -322,13 +398,15 @@ export default function App() {
       // Browser engine preview
       try {
         if (!window.speechSynthesis) return;
-        const selectedSystemVoice = browserVoices.find(v => v.voiceURI === selectedBrowserVoiceURI);
+        const selectedSystemVoice = browserVoices.find(v => v && v.voiceURI === selectedBrowserVoiceURI);
         const voiceLabel = selectedSystemVoice ? selectedSystemVoice.name : "Hệ Thống";
         const utterance = new SpeechSynthesisUtterance(`Chào bạn! Tôi là giọng đọc ${voiceLabel} của trình duyệt.`);
         
         if (selectedSystemVoice) {
           utterance.voice = selectedSystemVoice;
-          utterance.lang = selectedSystemVoice.lang;
+          if (selectedSystemVoice.lang) {
+            utterance.lang = selectedSystemVoice.lang;
+          }
         }
         utterance.rate = 1.0;
 
@@ -388,8 +466,12 @@ export default function App() {
     }
     
     // Stop browser local textToSpeech
-    if (typeof window !== "undefined" && window.speechSynthesis) {
-      window.speechSynthesis.cancel();
+    try {
+      if (typeof window !== "undefined" && window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+      }
+    } catch (e) {
+      console.warn("Speech synthesis local engine blocked on stopAllAudio:", e);
     }
     
     setIsPlaying(false);
@@ -483,27 +565,37 @@ export default function App() {
       setIsPlaying(true);
     } else {
       // Fallback local play
-      if (typeof window !== "undefined" && window.speechSynthesis) {
-        const utterance = new SpeechSynthesisUtterance(item.text);
-        const originalVoice = browserVoices.find(v => v.name === item.voiceName);
-        if (originalVoice) {
-          utterance.voice = originalVoice;
-        }
-        utterance.rate = parseFloat(item.speed);
-        
-        utterance.onstart = () => setIsPlaying(true);
-        utterance.onend = () => {
-          setIsPlaying(false);
-          setActivePlayingId(null);
-        };
-        utterance.onerror = () => {
-          setIsPlaying(false);
-          setActivePlayingId(null);
-        };
+      try {
+        if (typeof window !== "undefined" && window.speechSynthesis) {
+          const utterance = new SpeechSynthesisUtterance(item.text);
+          const originalVoice = browserVoices.find(v => v && v.name === item.voiceName);
+          if (originalVoice) {
+            utterance.voice = originalVoice;
+            if (originalVoice.lang) {
+              utterance.lang = originalVoice.lang;
+            }
+          } else {
+            utterance.lang = "vi-VN";
+          }
+          utterance.rate = parseFloat(item.speed);
+          
+          utterance.onstart = () => setIsPlaying(true);
+          utterance.onend = () => {
+            setIsPlaying(false);
+            setActivePlayingId(null);
+          };
+          utterance.onerror = () => {
+            setIsPlaying(false);
+            setActivePlayingId(null);
+          };
 
-        window.speechSynthesis.speak(utterance);
-      } else {
-        showFeedback("error", "Trình duyệt này không hỗ trợ phát lại không có cơ sở dữ liệu.");
+          window.speechSynthesis.speak(utterance);
+        } else {
+          showFeedback("error", "Trình duyệt này không hỗ trợ phát lại.");
+        }
+      } catch (err) {
+        console.warn("Speech Synthesis blocked on handleReplayItem:", err);
+        showFeedback("error", "Dịch vụ giọng đọc trình duyệt bị chặn trên môi trường thử nghiệm.");
       }
     }
   };
@@ -536,14 +628,18 @@ export default function App() {
       }
     } else {
       // Browser Toggle pause
-      if (typeof window !== "undefined" && window.speechSynthesis) {
-        if (isPlaying) {
-          window.speechSynthesis.pause();
-          setIsPlaying(false);
-        } else {
-          window.speechSynthesis.resume();
-          setIsPlaying(true);
+      try {
+        if (typeof window !== "undefined" && window.speechSynthesis) {
+          if (isPlaying) {
+            window.speechSynthesis.pause();
+            setIsPlaying(false);
+          } else {
+            window.speechSynthesis.resume();
+            setIsPlaying(true);
+          }
         }
+      } catch (err) {
+        console.warn("Speech Synthesis togglePlayPause blocked:", err);
       }
     }
   };
@@ -947,7 +1043,7 @@ export default function App() {
                     >
                       {browserVoices.map((voice) => (
                         <option key={voice.voiceURI} value={voice.voiceURI}>
-                          {voice.name} ({voice.lang}) {voice.localService ? "[Sẵn có]" : ""}
+                          {voice.name} ({voice.lang || "Không rõ ngôn ngữ"}) {voice.localService ? "[Sẵn có]" : ""}
                         </option>
                       ))}
                     </select>
